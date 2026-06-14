@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+import struct
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -27,6 +28,9 @@ from langgraph.graph import END, START, StateGraph
 from agent import prompts
 from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
+
+from pydantic import BaseModel, Field
+from urllib3 import response
 
 # Total generate + revise calls before the loop is forced to stop.
 # 3-5 is a reasonable range; tune it as part of Phase 3.
@@ -52,6 +56,22 @@ class AgentState:
     verify_issue: str = ""
     iteration: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
+
+
+class VerifyDecision(BaseModel):
+    """Structured output for the verify node.
+
+    Bound to the LLM via `.with_structured_output(method="json_schema")`,
+    which uses the OpenAI-compatible response_format spec. Both Token Factory
+    and vLLM enforce this server-side.
+    """
+    ok: bool = Field(
+        description="True if the execution result plausibly answers the question."
+    )
+    issue: str = Field(
+        default="",
+        description="One-sentence explanation when ok=false. Empty string when ok=true."
+    )
 
 
 def llm() -> ChatOpenAI:
@@ -124,7 +144,32 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    exec_result = state.execution
+
+    if exec_result is None or not exec_result.ok:
+        issue = exec_result.error if exec_result else "no execution result"
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history
+            + [{"node": "verify", "ok": False, "issue": issue}]
+        }
+
+    structured = llm().with_structured_output(VerifyDecision, method="json_schema")
+    decision: VerifyDecision = structured.invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=exec_result.render(),
+        )),
+    ])
+    return {
+        "verify_ok": decision.ok,
+        "verify_issue": decision.issue,
+        "history": state.history
+        + [{"node": "verify", "ok": decision.ok, "issue": decision.issue}]
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +182,25 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    exec_result = state.execution
+
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            previous_sql=state.sql,
+            previous_result=exec_result.render() if exec_result else "no result",
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history
+        + [{"node": "revise", "sql": sql, "addressed_issue": state.verify_issue}]
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +209,11 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok:
+        return "end"
+    if state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
