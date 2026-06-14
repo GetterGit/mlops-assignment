@@ -28,3 +28,7 @@ screenshots/*.jpg
 
 # Lecture material (not part of the student repo)
 *.pdf
+
+# Backups
+vm.env.backup
+vllm.log.backup
