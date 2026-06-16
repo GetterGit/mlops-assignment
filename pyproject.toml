@@ -21,6 +21,7 @@ dependencies = [
     "httpx>=0.27,<1.0",
     "aiohttp>=3.9,<4.0",
     "tqdm>=4.66,<5.0",
+    "transformers>=4.50,<5.0",
 ]
 
 [build-system]
