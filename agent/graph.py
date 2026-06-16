@@ -168,20 +168,54 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
+# Phase 6 / iter4 — cheap deterministic post-execution heuristics.
+# Keyword-based, no LLM. The point is to catch the most common quality
+# failures (empty-when-expected, suspicious-cardinality) that iter3's pre-
+# execution self-assessment misses, AND to feed revise concrete evidence
+# ("0 rows but expected results") that the model can actually act on.
+_NONEMPTY_QUESTION_HINTS = (
+    "top ", "highest", "lowest", "most ", "least ", "best ", "worst ",
+    "oldest", "newest", "largest", "smallest", "biggest",
+    "list ", "name the", "name all", "find the", "find all",
+    "which ", "who ", "what is the", "what are the",
+    "all the", "every ",
+)
+_SINGLE_ROW_QUESTION_HINTS = (
+    "the highest", "the lowest", "the most", "the least",
+    "the best", "the worst", "the oldest", "the newest",
+    "the largest", "the smallest", "the biggest",
+    "who is the", "which is the", "what is the",
+)
+
+
+def _question_expects_nonempty(question: str) -> bool:
+    q = question.lower()
+    return any(h in q for h in _NONEMPTY_QUESTION_HINTS)
+
+
+def _question_expects_single_row(question: str) -> bool:
+    q = question.lower()
+    return any(h in q for h in _SINGLE_ROW_QUESTION_HINTS)
+
+
 def verify_node(state: AgentState) -> dict:
     """LLM-free post-execution gate.
 
-    Phase 6 / iter3: generate_sql_node and revise_node now produce a self-
-    assessment (verify_ok / verify_issue) as part of their single structured-
-    output call. This node no longer makes its own LLM call. Its job is to:
-      1. Override the self-assessment if SQLite actually returned an error
-         (only knowable post-execution), and
-      2. Append a verify entry to history for tracing parity with iter0-2.
+    Phase 6 evolution:
+    - iter3: collapsed generate+verify into one LLM call. verify_node became
+      a pass-through of the model's pre-execution self-assessment, with an
+      override only when SQLite returned an error.
+    - iter4 (this version): adds two deterministic post-execution heuristics
+      to restore the loop's value without re-introducing an LLM call. These
+      run AFTER the exec-error gate but BEFORE the self-assessment pass-
+      through, so they can override an overly-optimistic self-assessment
+      with concrete, evidence-grounded feedback for revise.
 
-    Quality tradeoff (documented in REPORT iter3): we lose post-execution
-    plausibility checks on shape/cardinality/empty results - those now
-    only get caught if the model's own pre-execution self-critique flagged
-    them. We gain ~50% throughput by halving vLLM round-trips per /answer.
+    Override priority:
+      1. Execution error (SQLite raised)            -> revise
+      2. EMPTY-WHEN-EXPECTED heuristic              -> revise
+      3. SUSPICIOUS-CARDINALITY heuristic           -> revise
+      4. Pass-through model self-assessment         -> end or revise
     """
     exec_result = state.execution
 
@@ -192,6 +226,31 @@ def verify_node(state: AgentState) -> dict:
             "verify_issue": issue,
             "history": state.history
             + [{"node": "verify", "ok": False, "issue": issue, "source": "execution_error"}]
+        }
+
+    if exec_result.row_count == 0 and _question_expects_nonempty(state.question):
+        issue = (
+            "EMPTY-WHEN-EXPECTED: the query returned 0 rows but the question "
+            "implies non-empty results."
+        )
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history
+            + [{"node": "verify", "ok": False, "issue": issue, "source": "post_exec_heuristic"}]
+        }
+
+    if exec_result.row_count > 1 and _question_expects_single_row(state.question):
+        issue = (
+            f"SUSPICIOUS-CARDINALITY: the query returned {exec_result.row_count} rows "
+            "but the question implies a single answer; consider adding LIMIT 1 "
+            "or an appropriate aggregation."
+        )
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history
+            + [{"node": "verify", "ok": False, "issue": issue, "source": "post_exec_heuristic"}]
         }
 
     return {

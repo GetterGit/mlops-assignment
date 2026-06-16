@@ -142,9 +142,95 @@ We expect: per-`/answer` vLLM calls drop from 2 → 1 on the happy path (and fro
 The original `verify_node` saw the *actual rows* after SQL execution, so it could catch EMPTY-WHEN-EXPECTED, wrong cardinality, etc. The merged self-assessment runs *before* execution, so those post-hoc checks are weaker — we now only catch shape/schema mistakes the model itself can foresee. This is expected to cost some `exec_match_at_3` quality. Iter3 will be evaluated with `evals/run_eval.py → results/eval_after_tuning.json` and the pass-rate delta vs `results/eval_baseline.json` reported honestly.
 
 ### Result (W)
-*To fill in after the run.*
+
+**The decisive iteration.** Halving vLLM round-trips per `/answer` moved every metric by more than an order of magnitude — and very nearly hit the SLO.
+
+| Metric | iter0 (baseline) | iter2 (best prior) | **iter3** | iter0 → iter3 |
+|---|---|---|---|---|
+| ok / 3000 | 573 (19 %) | 367 (12 %) | **2 603 (86.8 %)** | **+2 030 OK (4.5×)** |
+| timeouts | 1 323 | 1 604 | **1** | virtually eliminated |
+| http_errors | 326 | 246 | 396 | slightly worse |
+| achieved_rps | 8.33 | 8.33 | **9.50** | first iter to approach the 10 RPS target |
+| p50 (s) | 56.70 | 43.62 | **1.45** | **39× faster** |
+| p95 (s) | 118.50 | 115.32 | **6.90** | **17× faster** |
+| p99 (s) | 119.93 | 119.90 | 11.52 | |
+| latency_max (s) | 120.88 | 120.76 | 43.65 | no requests pinned at driver cap |
+
+**SLO verdict:** p95 = **6.90 s** vs target **< 5 s**. **Missed by 1.9 s** (a 38 % overshoot) but in the same order of magnitude as the SLO for the first time. Success rate (86.8 %) is healthy. The architecture change was the right diagnosis.
+
+**What the dashboard showed during the run:** scheduler `running` ramped cleanly to ~30–40 with `waiting` staying low (vs iter0 where it pinned at 128 with deep queues); decode tokens/sec ran in the steady 4–8 K range without the boom-and-bust shape of earlier iters; KV cache usage finally moved off the floor (~30–40 %) reflecting the larger in-flight working set; preemptions stayed at 0.
+
+**Open items the result exposed:**
+
+- **396 HTTP 500s remain (13 % of attempts).** With timeouts essentially gone, these aren't queue-collapse — they're either (a) structured-output decoding failing on edge questions (model emits JSON that doesn't fit `SqlWithAssessment`), (b) SQLite errors the model didn't predict, or (c) the model self-assessing `ok=false` repeatedly until iteration cap. Worth a Langfuse spot-check.
+- **p95 6.9 s** suggests one of the LLM call types is occasionally slow — likely the revise loop firing on some questions. Iter4 candidates to close the last 1.9 s: FP8 quant (per-token decode ~1.5–2× faster on H100), or `MAX_ITERATIONS=3 → 2` (caps the worst case at 2 LLM calls instead of 3).
 
 ### Artifacts
-- `results/load_test_iter3_merged_verify.json` *(to capture)*
-- `screenshots/grafana_iter3.png` *(to capture)*
-- `results/eval_after_tuning.json` *(to capture — quality check)*
+- `results/load_test_iter3_merged_verify.json`
+- `screenshots/grafana_after.png` (iter3 window — clean steady-state, low queue, low p95)
+- `screenshots/grafana_before.png` (iter0 storm window — captured for direct visual comparison)
+- `results/eval_after_tuning.json` (see eval read below)
+
+### Quality eval read (`eval_after_tuning.json`, 30 questions)
+
+```
+n=30  completion_rate=100.0%  wall_clock=9.6s
+final_exec_match_rate=33.3%   hit_max_rate=3.3%   mean_iterations=1.2
+exec_match_at_k=k1=33.3%  k2=33.3%  k3=33.3%
+```
+
+**The loop is dormant.** `k1 = k2 = k3 = 33.3 %` means the verify→revise loop adds zero quality in iter3. README Phase 5 calls this out explicitly: *"If iter 0 pass rate is the same as iter 3 pass rate, your agent architecture is doing nothing."* Two stacked failure modes caused this:
+
+1. **The loop rarely triggers.** Pre-execution self-assessment exhibits the well-known LLM self-evaluation bias: the model almost always says `ok=true` about its own output (~80 % of questions, given `mean_iterations = 1.2`). The original post-execution verify worked because it had *empirical evidence* — the actual rows — to disagree with.
+2. **When it triggers, revise can't improve.** The self-critique used to seed revise has no execution feedback — it's the same model second-guessing the same model with no new information.
+
+This is the quality regression we flagged as a risk going into iter3. Iter4 is the targeted fix.
+
+---
+
+## Iteration 4 — restore the loop with deterministic post-execution heuristics
+
+**Hypothesis going in:** the SLO-friendly half of iter3 (merged generate+verify, 1 LLM call on the happy path) is the right architecture. The quality regression is recoverable WITHOUT adding back an LLM call: we just need cheap, deterministic post-execution checks in `verify_node` that catch the failure modes self-assessment misses, and feed revise concrete evidence the model can act on.
+
+We expect: revise loop fires more often (more questions hit iter≥2), `exec_match_at_3 > exec_match_at_1` again (loop earns its keep), at the cost of only a small p95 regression (the few extra revises add latency but verify_node itself stays LLM-free).
+
+### Changes
+
+In `agent/graph.py::verify_node`, between the exec-error gate and the self-assessment pass-through, add two deterministic heuristics with concrete `verify_issue` strings:
+
+1. **EMPTY-WHEN-EXPECTED**: if `exec_result.row_count == 0` AND the question contains a keyword that implies a non-empty result (`top`, `highest`, `most`, `which`, `who`, `list`, `name the`, etc.) → force revise with a concrete complaint the model can act on.
+2. **SUSPICIOUS-CARDINALITY**: if `exec_result.row_count > 1` AND the question implies a single answer (`the highest`, `who is the`, `what is the`, etc.) → force revise with a suggestion to add `LIMIT 1` or aggregate.
+
+Both run AFTER the exec-error check and BEFORE the self-assessment pass-through. They're deterministic (keyword + count comparison only — zero LLM calls), so they preserve iter3's throughput. Their issue strings are concrete and post-execution-grounded, so revise has real signal to act on (vs the iter3 self-criticism which had none).
+
+A new `source: "post_exec_heuristic"` value is added to the verify history entry so Langfuse traces and the eval can distinguish heuristic-triggered revises from execution-error and self-assessment cases.
+
+### Test plan (run eval BEFORE load test)
+
+Eval first — if quality didn't recover, no point burning a 5-min load test:
+
+```bash
+uv run python evals/run_eval.py \
+    --out results/eval_iter4_hybrid.json \
+    --run-id phase6_iter4_hybrid
+```
+
+We're looking for:
+- `exec_match_at_3 > exec_match_at_1` (loop earning its keep)
+- `mean_iterations > 1.2` (more questions are looping)
+- Per-DB breakdown: `formula_1`, `thrombosis_prediction`, `toxicology` should pick up from 0 % (these were the EMPTY-WHEN-EXPECTED candidates)
+
+If those signals don't show, the heuristic keywords are wrong — debug and reroll. If they do show, then run the load test:
+
+```bash
+uv run python load_test/driver.py --rps 10 --duration 300 \
+    --out results/load_test_iter4_hybrid.json
+```
+
+### Result (W)
+*To fill in after the runs.*
+
+### Artifacts
+- `results/eval_iter4_hybrid.json`
+- `results/load_test_iter4_hybrid.json`
+- `screenshots/grafana_iter4.png`
