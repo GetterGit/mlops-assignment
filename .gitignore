@@ -17,6 +17,22 @@ data/bird/
 results/*.json
 screenshots/*.png
 screenshots/*.jpg
+# ...but DO track the deliverables explicitly (see README "Final deliverables")
+!results/eval_baseline.json
+!results/eval_after_tuning.json
+!results/eval_iter5_fp8.json
+!results/load_test_iter0_baseline.json
+!results/load_test_iter1_maxnumseqs32.json
+!results/load_test_iter2_maxtokens512.json
+!results/load_test_iter3_merged_verify.json
+!results/load_test_iter4_hybrid.json
+!screenshots/vllm_manual_query.png
+!screenshots/grafana_serving.png
+!screenshots/grafana_eval_run.png
+!screenshots/grafana_before.png
+!screenshots/grafana_after.png
+!screenshots/langfuse_trace.png
+!screenshots/langfuse_tags.png
 
 # HF cache (if anyone runs locally)
 .cache/
