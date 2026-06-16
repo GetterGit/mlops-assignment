@@ -228,9 +228,102 @@ uv run python load_test/driver.py --rps 10 --duration 300 \
 ```
 
 ### Result (W)
-*To fill in after the runs.*
+
+**Quality recovered, SLO regressed.** The deterministic heuristics fired exactly where intended, the revise loop earned its keep again, and the eval pass-rate climbed monotonically with iterations. But the cost of more iterations under concurrent load was a meaningful tail-latency regression.
+
+**Eval (30 questions):**
+
+| Metric | iter3 | iter4 | Δ |
+|---|---|---|---|
+| `exec_match_at_1` | 33.3 % | 33.3 % | flat (expected — first attempt logic unchanged) |
+| `exec_match_at_2` | 33.3 % | 36.7 % | **+3.4 pp** |
+| `exec_match_at_3` | 33.3 % | **40.0 %** | **+6.7 pp** |
+| `mean_iterations` | 1.2 | 1.6 | loop is firing |
+| `hit_max_rate` | 3.3 % | 16.7 % | more questions exhausting the loop |
+| eval mean latency | 1.05 s | 1.46 s | small cost (eval is sequential) |
+
+The k1 → k3 monotonic rise (33 → 36.7 → 40) is the Phase 5 signal the loop is doing real work, restored.
+
+**Load test (`--rps 10 --duration 300`):**
+
+| Metric | iter3 | iter4 | Δ |
+|---|---|---|---|
+| ok / 3000 | 2 603 (86.8 %) | 2 583 (86.1 %) | flat |
+| timeouts | 1 | 2 | flat |
+| achieved_rps | 9.50 | 9.34 | flat |
+| p50 (s) | **1.45** | **27.50** | **19× worse** |
+| p95 (s) | **6.90** | **57.79** | **8× worse** |
+| p99 (s) | 11.52 | 63.52 | |
+| latency_max (s) | 43.65 | 88.04 | |
+
+**Root cause:** the heuristic over-triggers under concurrent load. Two compounding effects:
+1. **No short-circuit on naturally-empty queries.** When the DB legitimately contains zero matching rows, EMPTY-WHEN-EXPECTED keeps firing for all 3 iterations — the model can't conjure rows that don't exist. Each such question burns 3 LLM calls instead of 1. The smoke test showed exactly this pattern (3× heuristic fires, hit MAX_ITERATIONS).
+2. **MAX_ITERATIONS = 3 × ~12 s per call under load saturation = 36 s of LLM compute per worst-case `/answer`**, which then queues behind other in-flight requests.
+
+The headline number `hit_max_rate = 16.7%` on the eval (vs 3.3% in iter3) is the smoking gun: a meaningful slice of requests now do 3 calls instead of 1.
+
+### Verdict
+Iter4 is the **quality winner** but the **SLO loser**. We don't ship it as-is; we attack the latency without giving back the quality. Iter5 keeps MAX_ITERATIONS=3 (k3 - k1 = +6.7 pp is real value worth preserving) and goes after per-call latency with FP8 quantization.
 
 ### Artifacts
 - `results/eval_iter4_hybrid.json`
 - `results/load_test_iter4_hybrid.json`
-- `screenshots/grafana_iter4.png`
+- `screenshots/grafana_iter4.png` *(to capture)*
+
+---
+
+## Iteration 5 — FP8 quantization (keep MAX_ITERATIONS=3, attack per-call latency)
+
+**Hypothesis going in:** iter4 proved the heuristic-driven loop is worth keeping for quality (+6.7 pp at k3), so we don't want to cap iterations. The latency damage comes from each LLM call being expensive (~10–12 s decode under load saturation) times 1.6 average calls per `/answer`. The cleanest single lever is to make each individual LLM call faster: **switch from BF16 to FP8 weights + FP8 KV cache**.
+
+On H100, FP8 native tensor cores deliver ~1.5–2× faster decode per token than BF16. FP8 weights also roughly halve VRAM footprint (~61 GB → ~30 GB), freeing budget so vLLM can sustain a larger effective batch under high concurrency (less queueing). Quantizing the KV cache to FP8 doubles the number of concurrent sequences that fit in cache memory.
+
+**Expected impact** (rough): each LLM call drops ~10–12 s → ~6–7 s; per-`/answer` compute (~1.6 calls) drops ~19 s → ~10–11 s; p95 should fall from 57 s into the ~25–35 s range. We don't expect to clear the 5 s SLO with this single change (we'd need to also reduce fan-out further, which kills quality), but we cut the gap roughly in half while keeping iter4's loop architecture and quality.
+
+**Risk:** FP8 quantization can degrade structured-output adherence (`with_structured_output(SqlWithAssessment)` + `xgrammar` schema enforcement). On schema-constrained tasks with `temperature=0.0`, the regression is usually small but not guaranteed. Mandatory eval re-run before declaring success.
+
+### Changes
+
+In `scripts/start_vllm.sh`:
+
+- `MODEL`: `Qwen/Qwen3-30B-A3B-Instruct-2507` → `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` (the official FP8 variant published by Qwen, ~30 GB)
+- `--dtype bfloat16` → `--dtype auto` (let vLLM pick FP8 from the model weights)
+- New: `--kv-cache-dtype fp8` (quantize KV cache to FP8 too — small marginal cost, doubles effective batch capacity)
+
+All other flags (`--max-model-len 8192`, `--max-num-seqs 128`, `--gpu-memory-utilization 0.90`, `--guided-decoding-backend xgrammar`, prefix caching + chunked prefill) unchanged. Agent code unchanged.
+
+### Test plan (eval first — strict gate)
+
+```bash
+# 1. On VM: pull, restart vLLM (model download ~30 GB, ~5-15 min first time)
+# 2. After vLLM ready, smoke test from Mac via tunnel:
+curl -s -X POST http://localhost:8001/answer \
+  -H 'content-type: application/json' \
+  -d '{"db":"california_schools","question":"How many schools are there?"}' \
+  | jq '{ok, iterations, sql}'
+
+# 3. Eval — quality gate
+uv run python evals/run_eval.py \
+    --out results/eval_iter5_fp8.json \
+    --run-id phase6_iter5_fp8
+```
+
+Decision tree on the eval result:
+- **k3 within ~3 pp of iter4's 40 %** → quality survived; proceed to load test.
+- **k3 dropped >5 pp** → FP8 hurt structured-output quality more than worth it; stop, write up iter5 as "quant regression, kept iter4 architecture", and iter4 becomes the final.
+- **k3 improved** → bonus; proceed to load test.
+
+Load test only if quality survived:
+
+```bash
+uv run python load_test/driver.py --rps 10 --duration 300 \
+    --out results/load_test_iter5_fp8.json
+```
+
+### Result (W)
+*To fill in after the runs.*
+
+### Artifacts
+- `results/eval_iter5_fp8.json`
+- `results/load_test_iter5_fp8.json` (only if eval gate passed)
+- `screenshots/grafana_iter5.png`
