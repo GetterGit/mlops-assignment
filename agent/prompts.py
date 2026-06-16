@@ -13,16 +13,36 @@ in the prompt bodies.
 
 GENERATE_SQL_SYSTEM = """\
     You are an expert SQLite analyst. Convert the user's question into a single
-    valid SQLite query that answers it.
+    valid SQLite query AND self-assess whether that query will plausibly answer
+    the question.
 
-    Rules:
+    Rules for the SQL:
     - Use only tables and columns from the schema provided.
     - Double-quote identifiers ("table"."column") when they contain spaces, dots,
     reserved words, or non-ASCII characters.
     - Prefer the simplest query that answers the question correctly. Use JOINs
     only when the question requires data from multiple tables.
-    - Return ONLY the SQL inside a ```sql ... ``` block. No prose, no comments,
-    no explanation.
+    - The `sql` field must be raw SQL: no markdown fences, no comments, no prose.
+
+    Rules for the self-assessment (the `ok` and `issue` fields):
+    Mark `ok=false` BEFORE the SQL is run if any of these are likely:
+    - WRONG-COLUMN-SHAPE: your SELECT list does not match what the question
+      asks (e.g. question wants a count but you return rows; question wants
+      names but you return only IDs).
+    - SUSPICIOUS-CARDINALITY: question implies a single row or a top-N but
+      your query has no LIMIT / no aggregation that would produce that.
+    - WRONG-TYPE: question asks for e.g. a year but your SELECT returns a
+      full date string with no extraction.
+    - SCHEMA-MISMATCH: you are uncertain whether the columns/tables you used
+      really exist in the provided schema.
+    Mark `ok=true` if the SQL shape matches the question intent and you are
+    confident the referenced tables/columns are in the schema. Being unable
+    to verify the underlying data is fine - the run-time check will catch
+    actual SQLite errors.
+
+    When `ok=false`, the `issue` field must be one short sentence naming
+    which check failed and what you'd change. When `ok=true`, `issue` must
+    be the empty string.
 """
 
 GENERATE_SQL_USER = """\
@@ -32,8 +52,7 @@ GENERATE_SQL_USER = """\
     Question:
     {question}
 
-    Write a single SQLite query that answers the question. Return only the SQL
-    inside a ```sql ... ``` block.
+    Produce the SQL and your self-assessment.
 """
 
 
@@ -85,12 +104,16 @@ REVISE_SYSTEM = """\
     review. You will see the user's question, the database schema, the previous
     SQL, what it returned, and the reviewer's complaint.
 
-    Write a NEW single SQLite query that:
-    - Still answers the original question.
-    - Directly addresses the reviewer's complaint (don't just shuffle syntax).
-    - Uses only tables and columns from the schema.
-
-    Return ONLY the new SQL inside a ```sql ... ``` block. No prose.
+    Produce a NEW single SQLite query AND a self-assessment, using the same
+    structured-output contract as the generate step:
+    - The new SQL must still answer the original question, directly address the
+      reviewer's complaint (don't just shuffle syntax), and use only tables
+      and columns from the schema.
+    - The `sql` field must be raw SQL: no markdown fences, no prose.
+    - Self-assess with the same rubric: set `ok=false` and a one-sentence
+      `issue` if your revised SQL still likely has a WRONG-COLUMN-SHAPE,
+      SUSPICIOUS-CARDINALITY, WRONG-TYPE, or SCHEMA-MISMATCH problem. Set
+      `ok=true` with empty `issue` if you believe the revision is correct.
 """
 
 REVISE_USER = """\
@@ -109,6 +132,5 @@ REVISE_USER = """\
     Reviewer's complaint:
     {issue}
 
-    Write a corrected SQLite query that addresses the complaint. Return only the
-    SQL inside a ```sql ... ``` block.
+    Produce a corrected SQL and your self-assessment.
 """

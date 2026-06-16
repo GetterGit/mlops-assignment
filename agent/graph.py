@@ -74,6 +74,36 @@ class VerifyDecision(BaseModel):
     )
 
 
+class SqlWithAssessment(BaseModel):
+    """Merged generate+verify output: the SQL plus the model's self-assessment.
+
+    Used to collapse the (generate -> execute -> verify) round-trip from 2 LLM
+    calls down to 1 on the happy path. The model produces the SQL AND predicts
+    whether the result would plausibly answer the question, BEFORE executing.
+    Post-execution checks (was there an actual error?) are still done locally
+    in verify_node without an LLM call.
+    """
+    sql: str = Field(
+        description=(
+            "A single valid SQLite query, raw (no markdown fences, no prose, "
+            "no trailing semicolon-only lines)."
+        )
+    )
+    ok: bool = Field(
+        description=(
+            "Pre-execution self-assessment: true if the model believes this "
+            "SQL will plausibly answer the question given the schema."
+        )
+    )
+    issue: str = Field(
+        default="",
+        description=(
+            "One-sentence explanation when ok=false (which rubric check the "
+            "SQL likely fails). Empty string when ok=true."
+        )
+    )
+
+
 def llm() -> ChatOpenAI:
     """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
     return ChatOpenAI(
@@ -103,27 +133,33 @@ def _extract_sql(text: str) -> str:
 
 
 def generate_sql_node(state: AgentState) -> dict:
-    """Worked example - the other LLM nodes follow this same shape.
+    """Generate SQL AND self-assess in a single LLM call.
 
-    Build messages from the prompts, call the shared llm(), extract the SQL,
-    and return only the state fields you changed. `iteration` is bumped here
-    (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
-
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    Phase 6 / iter3: previously this was two LLM calls (generate, then verify).
+    We now use structured output to get {sql, ok, issue} back in one shot,
+    halving vLLM round-trips per /answer. The post-execution sanity check
+    (did SQLite actually return an error?) still runs in verify_node, but
+    without an LLM call.
     """
-    response = llm().invoke([
+    structured = llm().with_structured_output(SqlWithAssessment, method="json_schema")
+    decision: SqlWithAssessment = structured.invoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
             question=state.question,
         )),
     ])
-    sql = _extract_sql(response.content)
     return {
-        "sql": sql,
+        "sql": decision.sql,
+        "verify_ok": decision.ok,
+        "verify_issue": decision.issue,
         "iteration": state.iteration + 1,
-        "history": state.history + [{"node": "generate_sql", "sql": sql}],
+        "history": state.history + [{
+            "node": "generate_sql",
+            "sql": decision.sql,
+            "self_ok": decision.ok,
+            "self_issue": decision.issue,
+        }],
     }
 
 
@@ -133,17 +169,19 @@ def execute_node(state: AgentState) -> dict:
 
 
 def verify_node(state: AgentState) -> dict:
-    """Decide whether state.execution plausibly answers state.question.
+    """LLM-free post-execution gate.
 
-    Follow the generate_sql_node pattern: build messages from the VERIFY_*
-    prompts, call llm(), parse the reply. Ask the model for a small JSON object
-    like {"ok": bool, "issue": str} and parse it defensively - the model may
-    wrap it in prose or fences. state.execution.render() gives you a compact
-    view of the rows or error to feed into the prompt.
+    Phase 6 / iter3: generate_sql_node and revise_node now produce a self-
+    assessment (verify_ok / verify_issue) as part of their single structured-
+    output call. This node no longer makes its own LLM call. Its job is to:
+      1. Override the self-assessment if SQLite actually returned an error
+         (only knowable post-execution), and
+      2. Append a verify entry to history for tracing parity with iter0-2.
 
-    Return: {"verify_ok": <bool>, "verify_issue": <str>}.
-    What counts as "not plausible" is yours to define - see the Phase 3 targets
-    in the README.
+    Quality tradeoff (documented in REPORT iter3): we lose post-execution
+    plausibility checks on shape/cardinality/empty results - those now
+    only get caught if the model's own pre-execution self-critique flagged
+    them. We gain ~50% throughput by halving vLLM round-trips per /answer.
     """
     exec_result = state.execution
 
@@ -153,39 +191,31 @@ def verify_node(state: AgentState) -> dict:
             "verify_ok": False,
             "verify_issue": issue,
             "history": state.history
-            + [{"node": "verify", "ok": False, "issue": issue}]
+            + [{"node": "verify", "ok": False, "issue": issue, "source": "execution_error"}]
         }
 
-    structured = llm().with_structured_output(VerifyDecision, method="json_schema")
-    decision: VerifyDecision = structured.invoke([
-        ("system", prompts.VERIFY_SYSTEM),
-        ("user", prompts.VERIFY_USER.format(
-            question=state.question,
-            sql=state.sql,
-            result=exec_result.render(),
-        )),
-    ])
     return {
-        "verify_ok": decision.ok,
-        "verify_issue": decision.issue,
         "history": state.history
-        + [{"node": "verify", "ok": decision.ok, "issue": decision.issue}]
+        + [{
+            "node": "verify",
+            "ok": state.verify_ok,
+            "issue": state.verify_issue,
+            "source": "self_assessment",
+        }]
     }
 
 
 def revise_node(state: AgentState) -> dict:
-    """Produce a revised SQL query given state.verify_issue and the prior attempt.
+    """Produce a revised SQL + self-assessment in a single LLM call.
 
-    Same shape as generate_sql_node, but the prompt should include the failing
-    SQL, its execution result, and the verifier's complaint so the model can fix
-    it. Bump the iteration counter the same way generate_sql_node does so the
-    loop terminates.
-
-    Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
+    Phase 6 / iter3: same structured-output pattern as generate_sql_node so the
+    next verify_node call is LLM-free. previous_sql/previous_result/issue are
+    fed in so the model can fix the prior mistake.
     """
     exec_result = state.execution
 
-    response = llm().invoke([
+    structured = llm().with_structured_output(SqlWithAssessment, method="json_schema")
+    decision: SqlWithAssessment = structured.invoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
@@ -195,12 +225,19 @@ def revise_node(state: AgentState) -> dict:
             issue=state.verify_issue,
         )),
     ])
-    sql = _extract_sql(response.content)
     return {
-        "sql": sql,
+        "sql": decision.sql,
+        "verify_ok": decision.ok,
+        "verify_issue": decision.issue,
         "iteration": state.iteration + 1,
         "history": state.history
-        + [{"node": "revise", "sql": sql, "addressed_issue": state.verify_issue}]
+        + [{
+            "node": "revise",
+            "sql": decision.sql,
+            "addressed_issue": state.verify_issue,
+            "self_ok": decision.ok,
+            "self_issue": decision.issue,
+        }]
     }
 
 
